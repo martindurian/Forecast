@@ -1,0 +1,277 @@
+---
+title: "Energy consumption estimation"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+Data preparation
+
+```{r include=FALSE}
+library(tidyverse)
+library(tsibble)
+library(lubridate)
+working_path <- "C:/Users/sk0007/OneDrive - Daikin Europe N.V/Documents/R scripts/DCS/DCS/DM_all/DM PodBisk 01012018-31122019"
+source("C:/Users/sk0007/OneDrive - Daikin Europe N.V/Documents/R scripts/DCS/DCS/MasterSctripts/Functions.R")
+load(file=file.path(working_path, "Data_structure.Rda"))
+
+# data frame preparation -----
+outdoor_dframe <- Data_structure$Out_DF_list_outdoors[[1]] %>%
+  mutate(OpeMode=if_else(Cooling.capacity==0&Heating.capacity==0&Operation.control.mode=="Heat recovery normal control", "HeRec", OpeMode)) %>% 
+  select(TimeStampPosixct, consumption = Watt.hour.amount.Corrected., ambient = O.U.1.outside.air.temp., OpeMode, SystemIdentifier) %>% 
+  mutate(consumption = replace(consumption, consumption == 0, 0.015))
+
+
+sys_ident <- distinct(outdoor_dframe, SystemIdentifier) %>% 
+  deframe()
+
+# indoor average sepotints -----
+indoors_average_values <- Data_structure %>% 
+  pluck("Merged_Indoor_Units") %>%
+  arrange(TimeStampPosixct) %>% 
+  filter(SystemIdentifier == sys_ident) %>% 
+  select(TimeStampPosixct, Avg..setting.temp., Indoor.unit.operation.time.accumulation, Suction.air.temp., UnitType, SystemIdentifier, UniqueIdentifier) %>% 
+  mutate(Suction.air.temp. = replace(Suction.air.temp., Suction.air.temp. == 0, NA)) %>% 
+  group_by(UniqueIdentifier) %>% 
+  fill(Avg..setting.temp., Suction.air.temp., .direction = "downup") %>% 
+  ungroup() %>% 
+  mutate(unit_size = get_unit_size(UnitType), 
+         setpoint_factor = Avg..setting.temp.*unit_size, 
+         ope_time_factor = Indoor.unit.operation.time.accumulation/60 * unit_size,
+         suction_factor = Suction.air.temp. * unit_size) %>% 
+  group_by(TimeStampPosixct) %>% 
+  summarise(setpoint_factor_sum = sum(setpoint_factor, na.rm = TRUE), 
+            unit_size_sum = sum(unit_size, na.rm = TRUE), 
+            average_setpoint=setpoint_factor_sum/unit_size_sum,
+            ope_time_factor_sum = sum(ope_time_factor, na.rm = TRUE), 
+            average_ope_time = ope_time_factor_sum/unit_size_sum, 
+            suction_factor_sum = sum(suction_factor, na.rm = TRUE),
+            average_suction = suction_factor_sum/unit_size_sum) %>% 
+  ungroup() %>% 
+  select(-contains("sum"))
+  
+
+# data frAme with indoor average setpoints -----
+total_tsbl <- outdoor_dframe %>% 
+  left_join(indoors_average_values, by="TimeStampPosixct") %>% 
+  group_by(TimeStampPosixct) %>% 
+  filter(row_number()==1) %>% 
+  ungroup() %>% 
+  as_tsibble(index = TimeStampPosixct) %>% 
+  fill_gaps() %>% 
+  fill(everything(), .direction = "downup")
+
+# add dummy variables -----
+add_dummy_cooling_fun <- function (df) df %>% 
+  mutate(dummy.cooling = if_else(OpeMode == "Cooling", 1, 0),
+         dummy.heating = if_else(OpeMode == "Heating", 1, 0))
+
+tsbl_to_daily <- function (df) {
+  daily_df <- df %>% 
+  index_by(date.stamp = date(TimeStampPosixct)) %>% 
+  summarise(OpeMode = names(table(OpeMode))[which.max(table(OpeMode))], 
+            consumption = sum(consumption), 
+            average_setpoint = mean(average_setpoint), 
+            ambient = mean(ambient),
+            average_ope_time = mean(average_ope_time),
+            average_suction = mean(average_suction)) %>% 
+            rename(TimeStampPosixct = date.stamp)
+  return (daily_df)
+}
+
+hourly_tsbl <- total_tsbl %>% 
+  add_dummy_cooling_fun() %>% 
+  select(-c(OpeMode, SystemIdentifier))
+
+daily_tsbl <- total_tsbl %>% 
+  tsbl_to_daily() %>% 
+  add_dummy_cooling_fun()%>% 
+  select(-c(OpeMode))
+
+```
+
+This is hourly and daily dataframe
+
+```{r}
+
+print(hourly_tsbl)
+
+print(daily_tsbl)
+
+```
+
+Try to find predictors
+https://rstudio-pubs-static.s3.amazonaws.com/2897_9220b21cfc0c43a396ff9abf122bb351.html
+
+```{r evaluating predictors}
+
+library(leaps)
+regsubsets.out <-
+    regsubsets(consumption ~ ambient + average_suction + average_setpoint + dummy.cooling + dummy.heating,
+               data = hourly_tsbl,
+               nbest = 1,       # 1 best model for each number of predictors
+               nvmax = NULL,    # NULL for no limit on number of variables
+               force.in = NULL, force.out = NULL,
+               method = "exhaustive")
+regsubsets.out
+summary.out <- summary(regsubsets.out)
+as.data.frame(summary.out$outmat)
+plot(regsubsets.out, scale = "adjr2", main = "Adjusted R^2")
+
+hourly_tsbl %>% 
+  mutate(average_setpoint**2) %>% 
+  as_tibble() %>% 
+  # select(consumption, ambient, average_suction, dummy.cooling, dummy.heating) %>% 
+  filter(dummy.heating == 1, consumption > 0) %>% 
+  select(-contains("dummy")) %>% 
+GGally::ggpairs()
+
+```
+
+Multiple linear regression TSLM 
+
+```{r}
+require(fpp3) #tsibbledata, feasts, fable
+library(cowplot)
+library(flextable)
+
+# plot
+plot_fun <- function(fit) {
+  fit_plot <- augment(fit) %>% 
+    gather("var", "value", .fitted, consumption) %>%
+    ggplot(aes(x = TimeStampPosixct, y = value, color = var)) +
+    geom_line(alpha = 0.5) +
+    scale_color_manual(values = c(consumption = "light grey", .fitted  = "#0097e0"))+
+    xlab("Time") + ylab(NULL) +
+    ggtitle("TSLM")+
+    theme_minimal_hgrid()
+  
+  tbl_img <- accuracy(fit) %>% 
+    flextable() %>% 
+    as_raster()
+  
+  tbl_sum_img <- augment(fit) %>% 
+    as_tibble() %>% 
+    summarise(sum(.fitted), sum(consumption)) %>% 
+    flextable() %>% 
+    as_raster()
+  
+  grid_plt <- cowplot::plot_grid(fit_plot, 
+                                 ggdraw() + draw_image(tbl_img, scale = 0.7), 
+                                 ggdraw() + draw_image(tbl_sum_img, scale = 0.4), 
+                                 ncol = 1,
+                                 rel_heights = c(2,1,0.5))
+  return (grid_plt)
+}
+
+model_desc_tslm <- "TSLM(box_cox(consumption, lambda = 0) ~ ambient + average_setpoint + dummy.cooling + dummy.heating + dummy.cooling:average_setpoint + dummy.heating:average_setpoint)"
+
+test_model_fun <- function (model_desc_tslm) map2(list(hourly_tsbl, daily_tsbl), list(model_desc_tslm, model_desc_tslm), function (df, model_desc) {
+   fit <- df %>%
+   model(eval(rlang::parse_expr(model_desc)))
+   fit_plt <- plot_fun(fit)
+   return(fit_plt)
+})
+
+test_model_fun (model_desc_tslm = "TSLM(box_cox(consumption, lambda = 0) ~ ambient + average_setpoint + dummy.cooling + dummy.heating + dummy.cooling:average_setpoint + dummy.heating:average_setpoint)")
+
+
+test_model_fun (model_desc_tslm = "TSLM(consumption ~ ambient + average_setpoint + dummy.cooling)") # suma sedí ale kúrenie moc nízke
+test_model_fun (model_desc_tslm = "TSLM(consumption ~ ambient + average_setpoint + dummy.cooling + dummy.heating)") # suma sedí ale aj negatívne výsledky
+test_model_fun (model_desc_tslm = "TSLM(box_cox(consumption, lambda = 0) ~ ambient + average_setpoint + dummy.cooling + dummy.heating)") # pozitívne výsledky, ale suma nesedí
+test_model_fun (model_desc_tslm = "ARIMA(consumption ~ ambient + average_setpoint + dummy.cooling + dummy.heating)") # suma sedí pekne kopíruje ale sú aj negatívne
+
+
+```
+
+
+```{r better workflow daily fit}
+
+# training set
+training_set_tsbl <- daily_tsbl %>% 
+  filter(TimeStampPosixct %within% (ymd_hms("2018-01-01 00:00:00") %--% ymd_hms("2018-12-31 23:30:00")))
+
+# testing set
+testing_set_tsbl <- daily_tsbl %>% 
+  anti_join(training_set_tsbl, by = "TimeStampPosixct") %>% 
+  rename(real.consumption = consumption)
+
+# single fit multiple models
+daily_fit <- training_set_tsbl %>% 
+  model (TSLM_max = TSLM(box_cox(consumption, lambda = 0) ~ ambient + average_setpoint + dummy.cooling + dummy.heating + dummy.cooling:average_setpoint + dummy.heating:average_setpoint),
+         TSLM_amb_set_dc = TSLM(consumption ~ ambient + average_setpoint + dummy.cooling),
+         TSLM_amb_set_dc_dh = TSLM(consumption ~ ambient + average_setpoint + dummy.cooling + dummy.heating),
+         TSLM_log_amb_set_dc_dh = TSLM(box_cox(consumption, lambda = 0) ~ ambient + average_setpoint + dummy.cooling + dummy.heating),
+         AR_amb_set_dc_dh = ARIMA(consumption ~ ambient + average_setpoint + dummy.cooling + dummy.heating),
+         AR_log_amb_set_dc_dh = ARIMA(box_cox(consumption, lambda = 0) ~ ambient + average_setpoint + dummy.cooling + dummy.heating),
+         AR_amb_set_dc_dh_interfer = ARIMA(consumption ~ ambient + average_setpoint + dummy.cooling + dummy.heating + dummy.cooling:average_setpoint + dummy.heating:average_setpoint)
+         )
+
+accuracy(daily_fit)
+
+augment(daily_fit) %>% 
+  as_tibble() %>% 
+  group_by(.model) %>% 
+  summarise(sum(.fitted), sum(consumption))
+
+forecast_daily_tsbl <- forecast(daily_fit, new_data = testing_set_tsbl)
+
+forecast_daily_tsbl %>% 
+  as_tibble() %>% 
+  group_by(.model) %>% 
+  summarise(sum(real.consumption), sum(consumption))
+
+# forecast
+setback <- 2
+testing_set_setback_tsbl <- testing_set_tsbl %>% 
+  mutate(average_setpoint = case_when(dummy.cooling == 1 ~ average_setpoint+setback,
+                                      dummy.heating == 1 ~ average_setpoint-setback,
+                                      TRUE ~ average_setpoint))
+
+forecast_daily_setback_tsbl <- forecast(daily_fit, new_data = testing_set_setback_tsbl)
+
+forecast_daily_setback_tsbl %>% 
+  as_tibble() %>% 
+  group_by(.model) %>% 
+  summarise(sum(real.consumption), sum(consumption))
+
+```
+
+```{r ggwrap}
+whole_plt <- daily_fit %>%  
+  forecast(new_data = testing_set_tsbl) %>% 
+  filter(str_detect(.model, "AR_")) %>% 
+autoplot() + 
+  autolayer(training_set_tsbl, color = "black") 
+
+whole_plt_mod <- whole_plt +
+  geom_line(data = faceted_tsbl, aes(x = TimeStampPosixct, y = real.consumption, color = "real.consumption"), inherit.aes = F) +
+  theme_minimal_hgrid()+
+  theme(legend.position = "bottom") +
+  scale_x_date(date_breaks = "1 day", date_labels = "%d")
+
+  # scale_color_manual(values = c("real.consumption" = "black"))
+  ggwrap(whole_plt_mod, 6)
+  
+panel_nr <- forecast_daily_tsbl %>% 
+    distinct(TimeStampPosixct) %>% 
+    group_by(yearmonth(TimeStampPosixct)) %>% 
+    count() %>% 
+    nrow()
+    
+whole_plt_2 <- ggplot(data = forecast_daily_tsbl, aes(x = TimeStampPosixct, y = consumption, color = .model, shape = .model, linetype = .model, group = .model))+
+    geom_line() + 
+    geom_point() + 
+    geom_ribbon(data = forecast_daily_tsbl, aes(x = TimeStampPosixct, ymin = 0, ymax = real.consumption), color = "dark grey", fill = "grey 78", alpha = 0.4, size = 1, inherit.aes = F) +
+    scale_x_date(date_breaks = "1 day", date_labels = "%d") +
+    theme(axis.title = element_blank(), legend.position="bottom", panel.background = element_blank())
+whole_plt_2
+
+  ggwrap(whole_plt_2, panel_nr)
+
+```
+ 
+
+

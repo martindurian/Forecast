@@ -1,0 +1,57 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r DoS data preparation}
+# based on previous calculations
+fcst_column_list <- single_datapoint_df_list %>%
+    keep(str_detect(names(.), "df_1.1.ACTUALCAPACIT|df_1.1.AVERAGEPOWER|df_1.1.OATEMP|df_1.1.EVAPLVGWTEMP")) %>% 
+  unique()
+fcst_merged_df <- Merge_tsibble(fcst_column_list)
+
+fcst_merged_df
+
+fcst_long_df <- map(fcst_column_list, function (df) {
+    df %>% 
+    as_tibble() %>% 
+    select(-Interval) %>% 
+    mutate(key=names(.)[2]) %>% 
+    rename(value = names(.)[2])
+}) %>% 
+  bind_rows() %>% 
+  arrange(UTC.Time) %>% 
+  as_tsibble(index = UTC.Time, key=key, regular=FALSE)
+
+# regularising the df
+fcst_reg_df <- fcst_merged_df %>% 
+  arrange(UTC.Time)%>%
+    index_by(UTC.Time_regularised=floor_date(UTC.Time,"1 minute"))%>%
+    summarise_all(mean)%>%
+    fill_gaps()%>%
+    fill(everything())%>%
+    mutate(Interval=lead(UTC.Time_regularised)-UTC.Time_regularised)
+
+forecast_path <- file.path("C:","Users", "sk0007", "OneDrive - Daikin Europe N.V", "Documents","R scripts","Forecast")
+
+save(fcst_merged_df, file = file.path(forecast_path, "fcst_merged_df.Rda"))
+save(fcst_reg_df, file = file.path(forecast_path, "fcst_reg_df.Rda"))
+save(fcst_long_df, file = file.path(forecast_path, "fcst_long_df.Rda"))
+
+ggplot2::autoplot(as_tibble(fcst_merged_df))
+
+
+```
+
+```{r plot EDA}
+
+library(fable)
+autoplot(fcst_long_df)
+fcst_merged_df %>% 
+  model()
+
+```
+

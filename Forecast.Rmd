@@ -21,6 +21,7 @@ library(lubridate)
 library(fpp3) #tsibbledata, feasts, fable
 library(cowplot)
 library(ggwrap)
+library(fable.prophet)
 
 
 working_path <- "C:/Users/sk0007/OneDrive - Daikin Europe N.V/Documents/R scripts/DCS/DCS/DM_all/DM PodBisk 01012018-31122019"
@@ -176,15 +177,14 @@ https://otexts.com/fpp3/selecting-predictors.html
 
 ```{r better workflow daily fit, include=TRUE}
 # training set
-training_set_tsbl <- daily_tsbl %>% 
-  filter(TimeStampPosixct %within% (ymd_hms("2018-01-01 00:00:00") %--% ymd_hms("2018-12-31 23:30:00")))
 
+fit_mode_fun <- function(tsbl) {
+  sample_split <- rsample::initial_time_split(tsbl)
+training_set_tsbl <- rsample::training(sample_split)
 # testing set
 testing_set_tsbl <- daily_tsbl %>% 
   anti_join(training_set_tsbl, by = "TimeStampPosixct") %>% 
   rename(real.consumption = consumption)
-
-models_vec <- c(TSLM_max = as.formula(TSLM(box_cox(consumption, lambda = 0) ~ ambient + average_setpoint + dummy.cooling + dummy.heating + dummy.cooling:average_setpoint + dummy.heating:average_setpoint)))
 
 # single fit multiple models
 daily_fit <- training_set_tsbl %>% 
@@ -195,8 +195,12 @@ daily_fit <- training_set_tsbl %>%
          # TSLM_log_amb_set_dc_dh = TSLM(box_cox(consumption, lambda = 0) ~ ambient + average_setpoint + dummy.cooling + dummy.heating),
          AR_amb_set_dc_dh = ARIMA(consumption ~ ambient + average_setpoint + dummy.cooling + dummy.heating),
          # AR_log_amb_set_dc_dh = ARIMA(box_cox(consumption, lambda = 0) ~ ambient + average_setpoint + dummy.cooling + dummy.heating),
-         AR_amb_set_dc_dh_interfer = ARIMA(consumption ~ ambient + average_setpoint + dummy.cooling + dummy.heating + dummy.worktime + dummy.cooling:average_setpoint + dummy.heating:average_setpoint)
+         AR_amb_set_dc_dh_interfer = ARIMA(consumption ~ ambient + average_setpoint + dummy.cooling + dummy.heating + dummy.worktime + dummy.cooling:average_setpoint + dummy.heating:average_setpoint),
+         prophet = prophet(consumption ~ ambient + average_setpoint + dummy.cooling + dummy.heating + dummy.worktime)
          )
+}
+
+
 cat("Models:
 time series linear models:
 TSLM_max = 

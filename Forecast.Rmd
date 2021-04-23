@@ -31,7 +31,7 @@ source("C:/Users/sk0007/OneDrive - Daikin Europe N.V/Documents/R scripts/DCS/DCS
 source("forecast_functions_for_DCS.R")
 # load(file=file.path(working_path, "Data_structure.Rda"))
 
-buildings_to_include <- c(123)
+buildings_to_include <- c(118)
   # c(125, 123, 118, 116, 113, 111, 109, 108, 107, 102, 97) #c(123, 108, 109, 96, 44)
 building_data_files_rows <- slice(building_data_files, buildings_to_include)
 
@@ -57,6 +57,7 @@ buildings_lst <- map(building_data_files_rows$bin_data_file, function(datafile){
 
 save(buildings_lst, file = "buildings_lst.Rda")
 # load(file = "buildings_lst.Rda")
+imap(flatten(buildings_lst), ~ write_csv(.x, path = str_c("Processing/Einsteinova_out_", .y , ".csv")))
 
 ```
 
@@ -295,6 +296,8 @@ gbm_baseline_test <- RMV2.0::gbm_baseline(train_Data = rmv_input_data)
 
 ```{r RMV 2}
 
+system_name <- path_sanitize(unique(outdoor_df_lst[[1]]$UniqueIdentifier))
+
 export_df <- outdoor_df_lst[[1]] %>%
   as_tibble() %>% 
   select(TimeStampPosixct, consumption, ambient, average_suction, ope_time_out, Tes.mean.value ,Tcs.mean.value, hd, my, wd, contains("dummy")) %>% 
@@ -302,9 +305,9 @@ export_df <- outdoor_df_lst[[1]] %>%
   mutate(time = as.character(time, format = "%m/%d/%y %H:%M")) %>% 
   select(time, eload, Temp, average_suction, dummy.Heating, dummy.Cooling)
   
-  pre_installation_path <- file.path("C:/RMV2/Preinstallation/", Building_name)
+  pre_installation_path <- file.path("C:/RMV2/Preinstallation/", system_name)
   if(!dir.exists(pre_installation_path)) dir.create(path = pre_installation_path)
-  write_csv(export_df, path = str_c("C:/RMV2/Preinstallation/", Building_name, "/extra_var.csv"))
+  write_csv(export_df, path = str_c("C:/RMV2/Preinstallation/", system_name, "/extra_var.csv"))
 
 export_setback_df  <- outdoor_df_lst[[1]] %>%
   as_tibble() %>% 
@@ -315,9 +318,10 @@ export_setback_df  <- outdoor_df_lst[[1]] %>%
   select(-OpeMode, average_setpoint) %>% 
   select(time, eload, Temp, average_suction, dummy.Heating, dummy.Cooling)
   
-  post_installation_path <- file.path("C:/RMV2/Postinstallation/", Building_name)
+
+ post_installation_path <- file.path("C:/RMV2/Postinstallation/", system_name)
   if(!dir.exists(post_installation_path)) dir.create(path = post_installation_path)
-  write_csv(export_setback_df, path = str_c("C:/RMV2/Postinstallation/", Building_name, "/extra_var_setback.csv"))
+  write_csv(export_setback_df, path = str_c("C:/RMV2/Postinstallation/", system_name, "/extra_var_setback.csv"))
 
 ```
 
